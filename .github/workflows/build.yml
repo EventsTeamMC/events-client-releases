@@ -1,0 +1,171 @@
+# Compila Events Client en los tres sistemas y publica la release en ESTE repo.
+#
+# El código está en el repo privado EventsTeamMC/events-client: aquí solo se clona
+# para compilar. Este repo es público, así que sus minutos de Actions no cuentan
+# en la cuota de la organización, y por la misma razón sus registros los puede
+# leer cualquiera. De ahí las reglas de este archivo:
+#   · nada imprime código, rutas, dependencias ni configuración: la salida de
+#     npm y de build.js va a un archivo del runner que nunca se sube;
+#   · ni artifacts ni cachés (setup-node sin `cache`): la caché de un repo
+#     público la pueden leer las PR de forks;
+#   · solo `workflow_dispatch`: lo lanza quien tiene escritura en el repo;
+#   · cada ejecución borra las anteriores, y los registros caducan en 1 día.
+#
+# Secreto: SOURCE_TOKEN, un token fine-grained con SOLO «Contents: read» de
+# EventsTeamMC/events-client. Publicar usa el GITHUB_TOKEN de este repo.
+#
+# Se lanza desde events-client con `npm run release:ci` (o `-- --dry`).
+name: Events Client
+run-name: Events Client ${{ inputs.ref }}${{ inputs.dry_run && ' (prueba)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag o commit de events-client'
+        required: true
+      dry_run:
+        description: 'Prueba: compila los tres sistemas y no publica nada'
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: events-client
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      tag: ${{ steps.src.outputs.tag }}
+    steps:
+      - name: Ejecuciones anteriores fuera
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run list -R "$GITHUB_REPOSITORY" --status completed --limit 100 --json databaseId -q '.[].databaseId' \
+            | while read -r id; do gh run delete "$id" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || true; done
+
+      - name: Código
+        id: src
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "::error::ref no válido"; exit 1; }
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
+          git -C src checkout -q FETCH_HEAD
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(node -p "require('./src/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # Antes que los tres runners: si lo crea electron-builder, dos compiten y
+      # el que pierde falla con 422 already_exists (1.1.2).
+      - name: Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.src.outputs.tag }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then echo "$TAG ya existe."; exit 0; fi
+          PRE=""; [[ "$TAG" == *-* ]] && PRE="--prerelease --latest=false"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "${TAG#v}" --notes "" $PRE > /dev/null
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Código
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$SHA"
+          git -C src checkout -q FETCH_HEAD
+
+      - name: Dependencias
+        working-directory: src
+        run: |
+          npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
+            || { echo "::error::npm ci ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
+
+      - name: rpmbuild
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rpm > /dev/null
+
+      # El canal lo decide la versión de package.json, como en build.js.
+      # En la prueba, sin CI ni token: build.js no publica (publish: never).
+      - name: Compilar
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ !inputs.dry_run && github.token || '' }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          V=$(node -p "require('./package.json').version")
+          CH=""
+          [[ "$V" =~ -(beta|alpha|rc)\.?[0-9]*$ ]] && CH=--channel=beta
+          [[ "$V" =~ -private\.?[0-9]*$ ]] && CH=--channel=private
+          [ "$DRY" = true ] && unset CI GITHUB_ACTIONS
+          node build.js --obf=true --build=platform $CH > "$RUNNER_TEMP/build.log" 2>&1 \
+            || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local con npm run build)"; exit 1; }
+          echo "v$V"
+          ls dist | grep -E '\.(exe|msi|dmg|zip|AppImage|deb|rpm|tar\.gz)$' || true
+
+  # Solo queda descargable la última estable, más la beta más nueva si va por
+  # delante, y la -private más nueva (config.privateUpdate). Antes, el backend
+  # guarda las descargas de todas (panel → Ajustes → Versiones).
+  cleanup:
+    needs: [prepare, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Contadores y limpieza
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REPO=$GITHUB_REPOSITORY
+          if ! curl -fsS -X POST https://api.eventsmc.xyz/api/releases/snapshot > /dev/null; then
+            echo "No se pudieron guardar las descargas: no se borra nada."; exit 0
+          fi
+          STABLE=$(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isPrerelease --jq '[.[] | select(.isPrerelease == false and .publishedAt != null)] | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          STABLE_AT=$(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt --jq ".[] | select(.tagName == \"$STABLE\") | .publishedAt" || true)
+          BETA=$(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isPrerelease --jq '[.[] | select(.isPrerelease == true and .publishedAt != null and (.tagName | contains("-private.") | not))] | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          PRIVATE=$(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isPrerelease --jq '[.[] | select(.isPrerelease == true and .publishedAt != null and (.tagName | contains("-private.")))] | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          BETA_AT=$(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt --jq ".[] | select(.tagName == \"$BETA\") | .publishedAt" || true)
+          KEEP_BETA=""
+          if [ -n "$BETA" ] && { [ -z "$STABLE" ] || [[ "$BETA_AT" > "$STABLE_AT" ]]; }; then KEEP_BETA="$BETA"; fi
+          mapfile -t tags < <(gh release list -R "$REPO" --limit 100 --json tagName --jq '.[].tagName')
+          for tag in "${tags[@]}"; do
+            if [ "$tag" = "$CURRENT" ] || [ "$tag" = "$STABLE" ] || [ "$tag" = "$KEEP_BETA" ] || [ "$tag" = "$PRIVATE" ]; then continue; fi
+            echo "fuera $tag"
+            gh release delete "$tag" -R "$REPO" --yes --cleanup-tag > /dev/null || true
+          done
