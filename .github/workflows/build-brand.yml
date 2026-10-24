@@ -1,0 +1,235 @@
+# El launcher propio de un studio (plan Ultra). Mismas reglas que build.yml:
+# registros públicos sin código ni configuración, sin artifacts ni cachés, y
+# solo `workflow_dispatch`.
+#
+# Lo lanza el backend (POST /webhost/brands/:id/build) con BRAND_CODE_REPO
+# apuntando a este repo. Lee la marca del backend con BRAND_BUILD_KEY, crea su
+# repo público de releases si no existe (EventsTeamMC/launcher-<id>), compila
+# las plataformas pedidas con `build.js --brand` y avisa al backend.
+#
+# Secretos: SOURCE_TOKEN (solo «Contents: read» de events-client), BRANDS_TOKEN
+# (crear launcher-<id> y publicar en él) y BRAND_BUILD_KEY (el mismo de la VPS).
+# brand.json se pide en cada job y nunca se sube: en un repo público un artifact
+# lo puede descargar cualquiera.
+name: Launcher de marca
+run-name: Marca ${{ inputs.brand }}${{ inputs.dry_run && ' (prueba)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: 'Id de la marca'
+        required: true
+      platforms:
+        description: 'windows,macos,linux'
+        default: 'windows,macos,linux'
+      ref:
+        description: 'Tag o commit de events-client'
+        default: 'main'
+      dry_run:
+        description: 'Prueba: compila y no publica ni avisa al backend'
+        type: boolean
+        default: false
+
+concurrency:
+  group: brand-${{ inputs.brand }}
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  API: https://api.eventsmc.xyz/api
+  BRAND: ${{ inputs.brand }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      repo: ${{ steps.release.outputs.repo }}
+      old: ${{ steps.release.outputs.old }}
+      new: ${{ steps.release.outputs.new }}
+    steps:
+      - name: Ejecuciones anteriores fuera
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$BRAND" =~ ^[a-z][a-z0-9-]{2,31}$ ]] || { echo "::error::Id de marca no válido"; exit 1; }
+          gh run list -R "$GITHUB_REPOSITORY" --status completed --limit 100 --json databaseId -q '.[].databaseId' \
+            | while read -r id; do gh run delete "$id" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || true; done
+
+      - name: Código
+        id: src
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "::error::ref no válido"; exit 1; }
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
+          git -C src checkout -q FETCH_HEAD
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Marca
+        env:
+          KEY: ${{ secrets.BRAND_BUILD_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsS -H "x-brand-key: $KEY" "$API/brands/$BRAND/build-manifest" | jq '.data' > brand.json
+          jq -e '.id and .build.releasesRepo and .build.icon' brand.json > /dev/null
+
+      - name: Estado
+        if: ${{ !inputs.dry_run }}
+        env:
+          KEY: ${{ secrets.BRAND_BUILD_KEY }}
+        run: |
+          curl -fsS -X POST -H "x-brand-key: $KEY" -H 'Content-Type: application/json' \
+            -d "{\"runId\":\"$GITHUB_RUN_ID\",\"status\":\"running\"}" "$API/brands/$BRAND/build-status" > /dev/null
+
+      - name: Repo de releases (se crea si no existe)
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.BRANDS_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO=$(jq -r .build.releasesRepo brand.json); NAME=${REPO#*/}
+          # auto_init: un repo vacío no admite ni tags ni releases.
+          gh api "repos/$REPO" > /dev/null 2>&1 || gh api -X POST orgs/EventsTeamMC/repos \
+            -f name="$NAME" -F private=false -F auto_init=true \
+            -F has_issues=false -F has_wiki=false -F has_projects=false \
+            -f description="Instaladores de $(jq -r .build.productName brand.json)" > /dev/null
+
+      - name: Release en borrador
+        id: release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.BRANDS_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO=$(jq -r .build.releasesRepo brand.json)
+          VERSION=$(node -p "require('./src/package.json').version")
+          # Borradores de esta versión que dejó una ejecución que no llegó a `report`.
+          gh api "repos/$REPO/releases?per_page=100" --jq ".[] | select(.draft and .tag_name == \"v$VERSION\") | .id" \
+            | while read -r id; do gh api -X DELETE "repos/$REPO/releases/$id"; done
+          # Recompilar la misma versión: la release publicada sigue hasta que `report` publica la nueva completa.
+          OLD=""
+          if J=$(gh api "repos/$REPO/releases/tags/v$VERSION" 2> /dev/null); then OLD=$(jq -r .id <<< "$J"); fi
+          # Se crea aquí, una vez y en borrador: los jobs de cada plataforma solo suben a ella (antes competían, 422).
+          NEW=$(gh api -X POST "repos/$REPO/releases" -f tag_name="v$VERSION" -f name="$VERSION" -f body="" -F draft=true --jq .id)
+          { echo "repo=$REPO"; echo "old=$OLD"; echo "new=$NEW"; } >> "$GITHUB_OUTPUT"
+
+      - id: matrix
+        env:
+          P: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          OS=()
+          [[ "$P" == *windows* ]] && OS+=('"windows-latest"')
+          [[ "$P" == *macos* ]] && OS+=('"macos-latest"')
+          [[ "$P" == *linux* ]] && OS+=('"ubuntu-latest"')
+          [ ${#OS[@]} -gt 0 ] || { echo "::error::Sin plataformas"; exit 1; }
+          echo "matrix={\"os\":[$(IFS=,; echo "${OS[*]}")]}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Código
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init -q src
+          git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
+            fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$SHA"
+          git -C src checkout -q FETCH_HEAD
+
+      - name: Marca
+        env:
+          KEY: ${{ secrets.BRAND_BUILD_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsS -H "x-brand-key: $KEY" "$API/brands/$BRAND/build-manifest" \
+            | node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("fs").readFileSync(0, "utf8")).data))' > brand.json
+
+      - name: Dependencias
+        working-directory: src
+        run: |
+          npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
+            || { echo "::error::npm ci ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
+
+      - name: rpmbuild
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rpm > /dev/null
+
+      # Hasta que una estable lleve el código de marcas, main es una prerelease: se permite aquí.
+      - name: Compilar
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ !inputs.dry_run && secrets.BRANDS_TOKEN || '' }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          [ "$DRY" = true ] && unset CI GITHUB_ACTIONS
+          node build.js --obf=true --build=platform --brand=../brand.json --allow-prerelease > "$RUNNER_TEMP/build.log" 2>&1 \
+            || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
+          ls dist | grep -E '\.(exe|msi|dmg|zip|AppImage|deb|rpm|tar\.gz)$' || true
+
+  report:
+    needs: [prepare, build]
+    if: ${{ always() && !inputs.dry_run && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BRANDS_TOKEN }}
+      KEY: ${{ secrets.BRAND_BUILD_KEY }}
+      REPO: ${{ needs.prepare.outputs.repo }}
+      OLD: ${{ needs.prepare.outputs.old }}
+      NEW: ${{ needs.prepare.outputs.new }}
+    steps:
+      - name: Publicar (solo con todas las plataformas)
+        id: publish
+        if: needs.build.result == 'success'
+        run: |
+          set -euo pipefail
+          publish() { gh api -X PATCH "repos/$REPO/releases/$NEW" -F draft=false -f make_latest=true > /dev/null; }
+          # La release anterior de esta versión se va cuando la nueva ya está fuera;
+          # si GitHub no publica dos con el mismo tag, se va justo antes.
+          if publish; then
+            [ -z "$OLD" ] || gh api -X DELETE "repos/$REPO/releases/$OLD"
+          else
+            [ -n "$OLD" ] || exit 1
+            gh api -X DELETE "repos/$REPO/releases/$OLD"
+            publish
+          fi
+      - name: Borrador fuera (algo falló; la release anterior sigue)
+        if: always() && steps.publish.outcome != 'success'
+        run: gh api -X DELETE "repos/$REPO/releases/$NEW" || true
+      - name: Estado final
+        if: always()
+        env:
+          STATUS: ${{ steps.publish.outcome == 'success' && 'ok' || 'failed' }}
+        run: |
+          curl -fsS -X POST -H "x-brand-key: $KEY" -H 'Content-Type: application/json' \
+            -d "{\"runId\":\"$GITHUB_RUN_ID\",\"status\":\"$STATUS\"}" "$API/brands/$BRAND/build-status" > /dev/null
+      - name: Limpieza (las 2 últimas releases de la marca)
+        if: steps.publish.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mapfile -t old < <(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isDraft --jq 'map(select(.isDraft | not)) | sort_by(.publishedAt) | reverse | .[2:] | .[].tagName')
+          for tag in "${old[@]}"; do gh release delete "$tag" -R "$REPO" --yes --cleanup-tag > /dev/null || true; done
