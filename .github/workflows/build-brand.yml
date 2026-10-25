@@ -7,6 +7,11 @@
 # repo público de releases si no existe (EventsTeamMC/launcher-<id>), compila
 # las plataformas pedidas con `build.js --brand` y avisa al backend.
 #
+# El canal sale de la versión de `ref`, como en build.yml: X.Y.Z → release y
+# latest*.yml; X.Y.Z-beta.N → prerelease y beta*.yml, que solo leen los
+# jugadores con el canal beta. El backend elige `ref` (la última estable o la
+# última beta de Events Client) según el canal que pida el admin.
+#
 # Secretos: SOURCE_TOKEN (solo «Contents: read» de events-client), BRANDS_TOKEN
 # (crear launcher-<id> y publicar en él) y BRAND_BUILD_KEY (el mismo de la VPS).
 # brand.json se pide en cada job y nunca se sube: en un repo público un artifact
@@ -56,6 +61,7 @@ jobs:
       repo: ${{ steps.release.outputs.repo }}
       old: ${{ steps.release.outputs.old }}
       new: ${{ steps.release.outputs.new }}
+      pre: ${{ steps.release.outputs.pre }}
     steps:
       - name: Ejecuciones anteriores fuera
         env:
@@ -117,6 +123,9 @@ jobs:
           set -euo pipefail
           REPO=$(jq -r .build.releasesRepo brand.json)
           VERSION=$(node -p "require('./src/package.json').version")
+          PRE=false
+          [[ "$VERSION" =~ -private ]] && { echo "::error::Una marca no tiene builds privadas"; exit 1; }
+          [[ "$VERSION" == *-* ]] && PRE=true
           # Borradores de esta versión que dejó una ejecución que no llegó a `report`.
           gh api "repos/$REPO/releases?per_page=100" --jq ".[] | select(.draft and .tag_name == \"v$VERSION\") | .id" \
             | while read -r id; do gh api -X DELETE "repos/$REPO/releases/$id"; done
@@ -124,8 +133,8 @@ jobs:
           OLD=""
           if J=$(gh api "repos/$REPO/releases/tags/v$VERSION" 2> /dev/null); then OLD=$(jq -r .id <<< "$J"); fi
           # Se crea aquí, una vez y en borrador: los jobs de cada plataforma solo suben a ella (antes competían, 422).
-          NEW=$(gh api -X POST "repos/$REPO/releases" -f tag_name="v$VERSION" -f name="$VERSION" -f body="" -F draft=true --jq .id)
-          { echo "repo=$REPO"; echo "old=$OLD"; echo "new=$NEW"; } >> "$GITHUB_OUTPUT"
+          NEW=$(gh api -X POST "repos/$REPO/releases" -f tag_name="v$VERSION" -f name="$VERSION" -f body="" -F draft=true -F prerelease=$PRE --jq .id)
+          { echo "repo=$REPO"; echo "old=$OLD"; echo "new=$NEW"; echo "pre=$PRE"; } >> "$GITHUB_OUTPUT"
 
       - id: matrix
         env:
@@ -179,15 +188,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rpm > /dev/null
 
-      # Hasta que una estable lleve el código de marcas, main es una prerelease: se permite aquí.
       - name: Compilar
         working-directory: src
         env:
           GH_TOKEN: ${{ !inputs.dry_run && secrets.BRANDS_TOKEN || '' }}
           DRY: ${{ inputs.dry_run }}
         run: |
+          V=$(node -p "require('./package.json').version"); CH=""
+          [[ "$V" =~ -(beta|alpha|rc)\.?[0-9]*$ ]] && CH=--channel=beta
           [ "$DRY" = true ] && unset CI GITHUB_ACTIONS
-          node build.js --obf=true --build=platform --brand=../brand.json --allow-prerelease > "$RUNNER_TEMP/build.log" 2>&1 \
+          node build.js --obf=true --build=platform --brand=../brand.json $CH > "$RUNNER_TEMP/build.log" 2>&1 \
             || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
           ls dist | grep -E '\.(exe|msi|dmg|zip|AppImage|deb|rpm|tar\.gz)$' || true
 
@@ -201,13 +211,16 @@ jobs:
       REPO: ${{ needs.prepare.outputs.repo }}
       OLD: ${{ needs.prepare.outputs.old }}
       NEW: ${{ needs.prepare.outputs.new }}
+      PRE: ${{ needs.prepare.outputs.pre }}
     steps:
       - name: Publicar (solo con todas las plataformas)
         id: publish
         if: needs.build.result == 'success'
         run: |
           set -euo pipefail
-          publish() { gh api -X PATCH "repos/$REPO/releases/$NEW" -F draft=false -f make_latest=true > /dev/null; }
+          # Una beta sale como prerelease y no pasa a «latest»: los jugadores en estable no la ven.
+          LATEST=true; [ "$PRE" = true ] && LATEST=false
+          publish() { gh api -X PATCH "repos/$REPO/releases/$NEW" -F draft=false -f make_latest=$LATEST > /dev/null; }
           # La release anterior de esta versión se va cuando la nueva ya está fuera;
           # si GitHub no publica dos con el mismo tag, se va justo antes.
           if publish; then
@@ -227,9 +240,15 @@ jobs:
         run: |
           curl -fsS -X POST -H "x-brand-key: $KEY" -H 'Content-Type: application/json' \
             -d "{\"runId\":\"$GITHUB_RUN_ID\",\"status\":\"$STATUS\"}" "$API/brands/$BRAND/build-status" > /dev/null
-      - name: Limpieza (las 2 últimas releases de la marca)
+      # Las 2 últimas estables, y la beta más nueva si va por delante de la última estable.
+      - name: Limpieza
         if: steps.publish.outcome == 'success'
         run: |
           set -euo pipefail
-          mapfile -t old < <(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isDraft --jq 'map(select(.isDraft | not)) | sort_by(.publishedAt) | reverse | .[2:] | .[].tagName')
+          mapfile -t old < <(gh release list -R "$REPO" --limit 100 --json tagName,publishedAt,isDraft,isPrerelease --jq '
+            map(select(.isDraft | not)) | sort_by(.publishedAt) | reverse
+            | (map(select(.isPrerelease | not)) | .[0:2]) as $s
+            | (map(select(.isPrerelease)) | .[0:1] | map(select(($s | length) == 0 or .publishedAt > $s[0].publishedAt))) as $b
+            | ($s + $b | map(.tagName)) as $keep
+            | .[] | select(.tagName as $t | $keep | index($t) | not) | .tagName')
           for tag in "${old[@]}"; do gh release delete "$tag" -R "$REPO" --yes --cleanup-tag > /dev/null || true; done
