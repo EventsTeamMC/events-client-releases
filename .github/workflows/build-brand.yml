@@ -124,7 +124,6 @@ jobs:
           REPO=$(jq -r .build.releasesRepo brand.json)
           VERSION=$(node -p "require('./src/package.json').version")
           PRE=false
-          [[ "$VERSION" =~ -private ]] && { echo "::error::Una marca no tiene builds privadas"; exit 1; }
           [[ "$VERSION" == *-* ]] && PRE=true
           # Borradores de esta versión que dejó una ejecución que no llegó a `report`.
           gh api "repos/$REPO/releases?per_page=100" --jq ".[] | select(.draft and .tag_name == \"v$VERSION\") | .id" \
@@ -196,6 +195,7 @@ jobs:
         run: |
           V=$(node -p "require('./package.json').version"); CH=""
           [[ "$V" =~ -(beta|alpha|rc)\.?[0-9]*$ ]] && CH=--channel=beta
+          [[ "$V" =~ -private\.?[0-9]*$ ]] && CH=--channel=private
           [ "$DRY" = true ] && unset CI GITHUB_ACTIONS
           node build.js --obf=true --build=platform --brand=../brand.json $CH > "$RUNNER_TEMP/build.log" 2>&1 \
             || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
