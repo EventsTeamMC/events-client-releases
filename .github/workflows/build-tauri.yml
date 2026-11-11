@@ -13,7 +13,7 @@
 #
 # Secreto: SOURCE_TOKEN (Contents: read de EventsTeamMC/events-client).
 name: Events Client (Tauri)
-run-name: Events Client Tauri ${{ inputs.ref }}${{ inputs.entregar && ' (instaladores de prueba)' || ' (prueba)' }}
+run-name: ${{ inputs.entregar && 'Instaladores de prueba' || 'Compilación de prueba' }}
 
 on:
   workflow_dispatch:
@@ -136,6 +136,8 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
           # La de prueba se llama distinto y guarda aparte (env.rs PRUEBA): convive con el instalado.
           EC_PRUEBA: ${{ inputs.entregar && '1' || '' }}
+          # La de prueba lleva el inspector web (clic derecho → Inspeccionar) para ver errores.
+          FEAT: ${{ inputs.entregar && '--features devtools' || '' }}
           CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
         run: |
           LOG="$RUNNER_TEMP/build.log"
@@ -144,7 +146,7 @@ jobs:
             && (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
             && cd tauri/src-tauri \
             && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
-                 --config "$CFG" \
+                 --config "$CFG" $FEAT \
           ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
           echo "Paquetes:"
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
