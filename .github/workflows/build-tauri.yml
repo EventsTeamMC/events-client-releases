@@ -59,6 +59,7 @@ jobs:
       contents: write
     outputs:
       sha: ${{ steps.src.outputs.sha }}
+      version: ${{ steps.src.outputs.version }}
     steps:
       - name: Ejecuciones anteriores fuera
         env:
@@ -79,7 +80,9 @@ jobs:
           git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
             fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
           echo "sha=$(git -C src rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(git -C src show FETCH_HEAD:package.json | node -p 'JSON.parse(require("fs").readFileSync(0)).version')" >> "$GITHUB_OUTPUT"
+          # Tauri lleva su versión (tauri.conf.json); las de aquí, -dev.N en orden (la 9.ª ejecución fue la dev.1).
+          BASE=$(git -C src show FETCH_HEAD:tauri/src-tauri/tauri.conf.json | node -p 'JSON.parse(require("fs").readFileSync(0)).version')
+          echo "version=${BASE}-dev.$(( GITHUB_RUN_NUMBER - 8 ))" >> "$GITHUB_OUTPUT"
 
       # Un borrador no lo ve nadie fuera del repo, ni el actualizador ni la web de descargas.
       - name: Borrador de prueba
@@ -88,8 +91,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.src.outputs.version }}
         run: |
-          gh release delete tauri-prueba -R "$GITHUB_REPOSITORY" --yes > /dev/null 2>&1 || true
-          gh release create tauri-prueba -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION}t (Tauri) — prueba" \
+          # Un borrador por versión: quedan en orden (v2.0.0-beta.1-dev.1t, dev.2t…).
+          gh release create "v${VERSION}t" -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION}t (Tauri)" \
             --notes "v${VERSION}t · compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
 
   build:
@@ -141,6 +144,7 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
           # La de prueba se llama distinto y guarda aparte (env.rs PRUEBA): convive con el instalado.
           EC_PRUEBA: ${{ inputs.entregar && '1' || '' }}
+          EC_VERSION: ${{ needs.prepare.outputs.version }}
           # La de prueba lleva el inspector web (clic derecho → Inspeccionar) para ver errores.
           FEAT: ${{ inputs.entregar && '--features devtools' || '' }}
           CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
@@ -151,7 +155,7 @@ jobs:
             && (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
             && cd tauri/src-tauri \
             && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
-                 --config "$CFG" $FEAT \
+                 --config "$CFG" --config "{\"version\":\"$EC_VERSION\"}" $FEAT \
           ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
           echo "Paquetes:"
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
@@ -163,7 +167,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -print0             | xargs -0 gh release upload tauri-prueba -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
 
       - name: Registro cifrado
         if: failure()
