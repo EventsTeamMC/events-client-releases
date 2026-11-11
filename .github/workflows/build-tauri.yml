@@ -112,7 +112,7 @@ jobs:
               sudo apt-get update -qq
               sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
             fi
-          } >> "$LOG" 2>&1 || { echo "::error::No se pudo preparar el sistema"; echo "fallo=sistema" >> "$GITHUB_ENV"; exit 1; }
+          } >> "$LOG" 2>&1 || { echo "::error::No se pudo preparar el sistema"; exit 1; }
 
       - name: Compilar
         working-directory: src
@@ -120,18 +120,16 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
         run: |
           LOG="$RUNNER_TEMP/build.log"
-          set -o pipefail
-          {
-            set -e
-            npm ci --no-audit --no-fund --ignore-scripts
-            (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs)
-            cd tauri/src-tauri
-            npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
-              --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}'
-          } >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; echo "fallo=compilar" >> "$GITHUB_ENV"; exit 1; }
+          # Cadena con && (set -e no actúa dentro de un `||`) y en un subshell (el cd no se queda).
+          ( npm ci --no-audit --no-fund --ignore-scripts \
+            && (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
+            && cd tauri/src-tauri \
+            && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
+                 --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' \
+          ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
           echo "Paquetes:"
-          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -printf '%f  %k KB\n' 2>/dev/null \
-            || find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -exec basename {} \;
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            | while read -r f; do echo "  $(basename "$f")  $(( $(wc -c < "$f") / 1048576 )) MB"; done
 
       - name: Registro cifrado
         if: failure()
