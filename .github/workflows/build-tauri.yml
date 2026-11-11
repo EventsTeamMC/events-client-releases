@@ -13,7 +13,7 @@
 #
 # Secreto: SOURCE_TOKEN (Contents: read de EventsTeamMC/events-client).
 name: Events Client (Tauri)
-run-name: Events Client Tauri ${{ inputs.ref }} (prueba)
+run-name: Events Client Tauri ${{ inputs.ref }}${{ inputs.entregar && ' (instaladores de prueba)' || ' (prueba)' }}
 
 on:
   workflow_dispatch:
@@ -22,6 +22,10 @@ on:
         description: 'Rama o commit de events-client'
         required: true
         default: 'tauri'
+      entregar:
+        description: 'Subir los instaladores de prueba a un borrador privado (tauri-prueba)'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -52,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+      contents: write
     outputs:
       sha: ${{ steps.src.outputs.sha }}
     steps:
@@ -75,6 +80,15 @@ jobs:
             fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
           echo "sha=$(git -C src rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Un borrador no lo ve nadie fuera del repo, ni el actualizador ni la web de descargas.
+      - name: Borrador de prueba
+        if: ${{ inputs.entregar }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete tauri-prueba -R "$GITHUB_REPOSITORY" --yes > /dev/null 2>&1 || true
+          gh release create tauri-prueba -R "$GITHUB_REPOSITORY" --draft --title "Events Client (Tauri) — prueba"             --notes "Compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
+
   build:
     needs: prepare
     strategy:
@@ -87,6 +101,8 @@ jobs:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundles: 'appimage,deb', name: Linux }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -118,6 +134,9 @@ jobs:
         working-directory: src
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          # La de prueba se llama distinto y guarda aparte (env.rs PRUEBA): convive con el instalado.
+          EC_PRUEBA: ${{ inputs.entregar && '1' || '' }}
+          CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
         run: |
           LOG="$RUNNER_TEMP/build.log"
           # Cadena con && (set -e no actúa dentro de un `||`) y en un subshell (el cd no se queda).
@@ -125,11 +144,19 @@ jobs:
             && (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
             && cd tauri/src-tauri \
             && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
-                 --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' \
+                 --config "$CFG" \
           ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
           echo "Paquetes:"
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
             | while read -r f; do echo "  $(basename "$f")  $(( $(wc -c < "$f") / 1048576 )) MB"; done
+
+      - name: Subir al borrador
+        if: ${{ inputs.entregar }}
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -print0             | xargs -0 gh release upload tauri-prueba -R "$GITHUB_REPOSITORY" --clobber > /dev/null
 
       - name: Registro cifrado
         if: failure()
