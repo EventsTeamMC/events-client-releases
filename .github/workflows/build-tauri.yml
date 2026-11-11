@@ -79,15 +79,18 @@ jobs:
           git -C src -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' \
             fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
           echo "sha=$(git -C src rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(git -C src show FETCH_HEAD:package.json | node -p 'JSON.parse(require("fs").readFileSync(0)).version')" >> "$GITHUB_OUTPUT"
 
       # Un borrador no lo ve nadie fuera del repo, ni el actualizador ni la web de descargas.
       - name: Borrador de prueba
         if: ${{ inputs.entregar }}
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.src.outputs.version }}
         run: |
           gh release delete tauri-prueba -R "$GITHUB_REPOSITORY" --yes > /dev/null 2>&1 || true
-          gh release create tauri-prueba -R "$GITHUB_REPOSITORY" --draft --title "Events Client (Tauri) — prueba"             --notes "Compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
+          gh release create tauri-prueba -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION}t (Tauri) — prueba" \
+            --notes "v${VERSION}t · compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
 
   build:
     needs: prepare
@@ -128,7 +131,7 @@ jobs:
             rustup target add ${{ matrix.target }}
             if [ "$RUNNER_OS" = Linux ]; then
               sudo apt-get update -qq
-              sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
+              sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
             fi
           } >> "$LOG" 2>&1 || { echo "::error::No se pudo preparar el sistema"; exit 1; }
 
