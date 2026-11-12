@@ -101,10 +101,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundles: nsis, name: Windows }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundles: 'nsis,msi', name: Windows }
           - { os: macos-latest, target: aarch64-apple-darwin, bundles: 'app,dmg', name: macOS Apple Silicon }
           - { os: macos-latest, target: x86_64-apple-darwin, bundles: 'app,dmg', name: macOS Intel }
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundles: 'appimage,deb', name: Linux }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundles: 'appimage,deb,rpm', name: Linux }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -134,7 +134,7 @@ jobs:
             rustup target add ${{ matrix.target }}
             if [ "$RUNNER_OS" = Linux ]; then
               sudo apt-get update -qq
-              sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+              sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf rpm gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
             fi
           } >> "$LOG" 2>&1 || { echo "::error::No se pudo preparar el sistema"; exit 1; }
 
@@ -150,15 +150,22 @@ jobs:
           CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
         run: |
           LOG="$RUNNER_TEMP/build.log"
+          # WiX (MSI) solo admite versiones numéricas: 2.0.0-beta.1-dev.7 → 2.0.0.7.
+          MSI_VERSION="$(echo "$EC_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+').$(echo "$EC_VERSION" | grep -oE '[0-9]+$')"
           # Cadena con && (set -e no actúa dentro de un `||`) y en un subshell (el cd no se queda).
           ( npm ci --no-audit --no-fund --ignore-scripts \
             && (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
             && cd tauri/src-tauri \
             && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
-                 --config "$CFG" --config "{\"version\":\"$EC_VERSION\"}" $FEAT \
+                 --config "$CFG" --config "{\"version\":\"$EC_VERSION\",\"bundle\":{\"windows\":{\"wix\":{\"version\":\"$MSI_VERSION\"}}}}" $FEAT \
           ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
+          # Portable de Windows: el .exe tal cual, sin instalar (necesita WebView2, que trae Windows 10/11).
+          if [ "$RUNNER_OS" = Windows ]; then
+            exe="$(ls "tauri/target/${{ matrix.target }}/release/"*.exe | grep -vi 'setup\|uninstall' | head -1)"
+            7z a -tzip "tauri/target/${{ matrix.target }}/release/bundle/Events.Client_${EC_VERSION}_x64-portable.zip" "$exe" > /dev/null
+          fi
           echo "Paquetes:"
-          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
             | while read -r f; do echo "  $(basename "$f")  $(( $(wc -c < "$f") / 1048576 )) MB"; done
 
       - name: Subir al borrador
@@ -167,7 +174,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
 
       - name: Registro cifrado
         if: failure()
