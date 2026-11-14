@@ -159,10 +159,17 @@ jobs:
             && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
                  --config "$CFG" --config "{\"version\":\"$EC_VERSION\",\"bundle\":{\"windows\":{\"wix\":{\"version\":\"$MSI_VERSION\"}}}}" $FEAT \
           ) >> "$LOG" 2>&1 || { echo "::error::La compilación ha fallado (registro cifrado abajo)"; exit 1; }
-          # Portable de Windows: el .exe tal cual, sin instalar (necesita WebView2, que trae Windows 10/11).
+          # Portable de Windows: una carpeta «Events Client» con el .exe y, al lado, los recursos que el
+          # instalador pone junto a él (social/: la librería de Discord; sin ella no hay Amigos). Sin la
+          # ruta de compilación dentro del zip. Necesita WebView2, que trae Windows 10/11.
           if [ "$RUNNER_OS" = Windows ]; then
             exe="$(ls "tauri/target/${{ matrix.target }}/release/"*.exe | grep -vi 'setup\|uninstall' | head -1)"
-            7z a -tzip "tauri/target/${{ matrix.target }}/release/bundle/Events.Client_${EC_VERSION}_x64-portable.zip" "$exe" > /dev/null
+            zip="$PWD/tauri/target/${{ matrix.target }}/release/bundle/Events.Client_${EC_VERSION}_x64-portable.zip"
+            stage="$RUNNER_TEMP/portable/Events Client"
+            rm -rf "$RUNNER_TEMP/portable" && mkdir -p "$stage/social"
+            cp "$exe" "$stage/"
+            cp tauri/src-tauri/social/discord_partner_sdk.dll tauri/src-tauri/social/License-Notices.txt "$stage/social/"
+            ( cd "$RUNNER_TEMP/portable" && 7z a -tzip "$zip" "Events Client" > /dev/null )
           fi
           echo "Paquetes:"
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
