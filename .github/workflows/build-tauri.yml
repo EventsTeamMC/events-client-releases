@@ -171,6 +171,15 @@ jobs:
             cp tauri/src-tauri/social/discord_partner_sdk.dll tauri/src-tauri/social/License-Notices.txt "$stage/social/"
             ( cd "$RUNNER_TEMP/portable" && 7z a -tzip "$zip" "Events Client" > /dev/null )
           fi
+          # macOS: el DMG otra vez con create-dmg, para poner los iconos grandes (128 px; el de Tauri los
+          # deja pequeños) y el fondo a doble resolución (Retina). Lleva los términos igual que antes.
+          if [ "$RUNNER_OS" = macOS ]; then
+            app="$(ls -d "tauri/target/${{ matrix.target }}/release/bundle/macos/"*.app | head -1)"
+            dmg="$(ls "tauri/target/${{ matrix.target }}/release/bundle/dmg/"*.dmg | head -1)"
+            name="$(basename "$app")"
+            bg="$RUNNER_TEMP/dmg-background.tiff"
+            ( tiffutil -cathidpicheck tauri/src-tauri/icons/dmg-background.png tauri/src-tauri/icons/dmg-background@2x.png -out "$bg"               && brew install create-dmg               && rm -f "$dmg"               && create-dmg --volname "${name%.app}" --background "$bg" --window-size 660 420 --icon-size 128                    --icon "$name" 180 205 --app-drop-link 480 205 --hide-extension "$name"                    --eula tauri/src-tauri/installer/license.rtf --no-internet-enable "$dmg" "$app"             ) >> "$LOG" 2>&1 || { echo "::error::El DMG no se ha podido rehacer (registro cifrado abajo)"; exit 1; }
+          fi
           echo "Paquetes:"
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
             | while read -r f; do echo "  $(basename "$f")  $(( $(wc -c < "$f") / 1048576 )) MB"; done
