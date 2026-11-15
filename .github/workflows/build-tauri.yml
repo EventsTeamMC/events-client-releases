@@ -13,7 +13,7 @@
 #
 # Secreto: SOURCE_TOKEN (Contents: read de EventsTeamMC/events-client).
 name: Events Client (Tauri)
-run-name: ${{ inputs.entregar && 'Instaladores de prueba' || 'Compilación de prueba' }}
+run-name: ${{ inputs.publicar && 'Beta pública (borrador)' || inputs.entregar && 'Instaladores de prueba' || 'Compilación de prueba' }}
 
 on:
   workflow_dispatch:
@@ -24,6 +24,10 @@ on:
         default: 'tauri'
       entregar:
         description: 'Subir los instaladores de prueba a un borrador privado (tauri-prueba)'
+        type: boolean
+        default: false
+      publicar:
+        description: 'Beta pública: la versión de producción, firmada, en un borrador prerelease listo para publicar (no publica nada solo)'
         type: boolean
         default: false
 
@@ -82,11 +86,22 @@ jobs:
           echo "sha=$(git -C src rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
           # Tauri lleva su versión (tauri.conf.json); las de aquí, -dev.N en orden (la 9.ª ejecución fue la dev.1).
           BASE=$(git -C src show FETCH_HEAD:tauri/src-tauri/tauri.conf.json | node -p 'JSON.parse(require("fs").readFileSync(0)).version')
-          echo "version=${BASE}-dev.$(( GITHUB_RUN_NUMBER - 8 ))" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.publicar }}" = true ]; then echo "version=${BASE}" >> "$GITHUB_OUTPUT"; else echo "version=${BASE}-dev.$(( GITHUB_RUN_NUMBER - 8 ))" >> "$GITHUB_OUTPUT"; fi
 
       # Un borrador no lo ve nadie fuera del repo, ni el actualizador ni la web de descargas.
+      # La beta pública también empieza como borrador (prerelease): se publica a mano cuando toca.
+      - name: Borrador de la beta
+        if: ${{ inputs.publicar }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          gh release view "v${VERSION}t" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "v${VERSION}t" -R "$GITHUB_REPOSITORY" --draft --prerelease --title "Events Client ${VERSION}" \
+                 --notes "Beta de Events Client 2.0." > /dev/null
+
       - name: Borrador de prueba
-        if: ${{ inputs.entregar }}
+        if: ${{ inputs.entregar && !inputs.publicar }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.src.outputs.version }}
@@ -143,11 +158,14 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
           # La de prueba se llama distinto y guarda aparte (env.rs PRUEBA): convive con el instalado.
-          EC_PRUEBA: ${{ inputs.entregar && '1' || '' }}
+          EC_PRUEBA: ${{ inputs.entregar && !inputs.publicar && '1' || '' }}
+          # La beta pública va firmada para el actualizador (minisign; la pública está en tauri.conf.json).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.publicar && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.publicar && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
           EC_VERSION: ${{ needs.prepare.outputs.version }}
           # Ninguna lleva el inspector web: el código no se enseña (los errores van por diagnósticos y F1).
           FEAT: ''
-          CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
+          CFG: ${{ inputs.publicar && '{"build":{"beforeBuildCommand":""}}' || inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
         run: |
           LOG="$RUNNER_TEMP/build.log"
           # WiX (MSI) solo admite versiones numéricas: 2.0.0-beta.1-dev.7 → 2.0.0.7.
@@ -185,11 +203,22 @@ jobs:
             | while read -r f; do echo "  $(basename "$f")  $(( $(wc -c < "$f") / 1048576 )) MB"; done
 
       - name: Subir al borrador
-        if: ${{ inputs.entregar }}
+        if: ${{ inputs.entregar || inputs.publicar }}
         working-directory: src
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Lo que pide el actualizador de Tauri: el paquete y su firma (.sig). En macOS el .app.tar.gz
+          # se llama igual en las dos arquitecturas: se le pone la suya.
+          if [ "${{ inputs.publicar }}" = true ]; then
+            b="tauri/target/${{ matrix.target }}/release/bundle"
+            if [ "$RUNNER_OS" = macOS ]; then
+              arch="$(echo '${{ matrix.target }}' | cut -d- -f1)"
+              for f in "$b"/macos/*.app.tar.gz "$b"/macos/*.app.tar.gz.sig; do [ -f "$f" ] && cp "$f" "$b/$(basename "$f" | sed "s/\.app\.tar\.gz/_${arch}.app.tar.gz/")"; done
+            fi
+            find "$b" -maxdepth 2 -type f -name '*.sig' -not -path '*/macos/*' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+            find "$b" -maxdepth 1 -type f -name '*.app.tar.gz' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+          fi
           find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
 
       - name: Registro cifrado
@@ -206,3 +235,41 @@ jobs:
           gzip -9c "$RUNNER_TEMP/tail.log" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$RUNNER_TEMP/k" | base64 | tr -d '\n'; echo
           echo "===== FIN ====="
           rm -f "$RUNNER_TEMP/k"
+
+  # Beta pública: los dos avisos de versión nueva, en el borrador.
+  #  · latest.json: el actualizador de Tauri (paquete y firma de cada sistema).
+  #  · beta.yml: el de Electron en el canal beta (electron-updater). Le ofrece el instalador de
+  #    Tauri para Windows: así quien está en la beta del launcher de Electron pasa a esta.
+  feeds:
+    needs: [prepare, build]
+    if: ${{ inputs.publicar }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: latest.json y beta.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}t"; DL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          mkdir w && cd w
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sig' -p '*-setup.exe'
+          sig() { cat "$1" 2>/dev/null || true; }
+          win="$(ls *-setup.exe | head -1)"; mac_a="$(ls *aarch64.app.tar.gz.sig 2>/dev/null | head -1)"; mac_x="$(ls *x86_64.app.tar.gz.sig 2>/dev/null | head -1)"; lin="$(ls *.AppImage.sig 2>/dev/null | head -1)"
+          node -e '
+            const [v, dl, win, ma, mx, lin] = process.argv.slice(1);
+            const fs = require("fs"), name = (f) => encodeURIComponent(f.replace(/ /g, "."));
+            const p = {};
+            const add = (k, file, sigf) => { if (file && fs.existsSync(sigf)) p[k] = { signature: fs.readFileSync(sigf, "utf8").trim(), url: dl + "/" + name(file) }; };
+            add("windows-x86_64", win, win + ".sig");
+            if (ma) add("darwin-aarch64", ma.replace(/\.sig$/, ""), ma);
+            if (mx) add("darwin-x86_64", mx.replace(/\.sig$/, ""), mx);
+            if (lin) add("linux-x86_64", lin.replace(/\.sig$/, ""), lin);
+            fs.writeFileSync("latest.json", JSON.stringify({ version: v, notes: "", pub_date: new Date().toISOString(), platforms: p }, null, 2));
+            const crypto = require("crypto"), buf = fs.readFileSync(win), sha = crypto.createHash("sha512").update(buf).digest("base64"), file = win.replace(/ /g, ".");
+            fs.writeFileSync("beta.yml", `version: ${v}\nfiles:\n  - url: ${file}\n    sha512: ${sha}\n    size: ${buf.length}\npath: ${file}\nsha512: ${sha}\nreleaseDate: ${JSON.stringify(new Date().toISOString())}\n`);
+          ' "$VERSION" "$DL" "$win" "$mac_a" "$mac_x" "$lin"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber latest.json beta.yml > /dev/null
+          echo "Avisos subidos a $TAG (borrador). Para publicarla: gh release edit $TAG --draft=false"
