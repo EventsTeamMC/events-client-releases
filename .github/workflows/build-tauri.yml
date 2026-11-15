@@ -96,8 +96,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.src.outputs.version }}
         run: |
-          gh release view "v${VERSION}t" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
-            || gh release create "v${VERSION}t" -R "$GITHUB_REPOSITORY" --draft --prerelease --title "Events Client ${VERSION}" \
+          gh release view "v${VERSION}" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "v${VERSION}" -R "$GITHUB_REPOSITORY" --draft --prerelease --title "Events Client ${VERSION}" \
                  --notes "Beta de Events Client 2.0." > /dev/null
 
       - name: Borrador de prueba
@@ -107,8 +107,8 @@ jobs:
           VERSION: ${{ steps.src.outputs.version }}
         run: |
           # Un borrador por versión: quedan en orden (v2.0.0-beta.1-dev.1t, dev.2t…).
-          gh release create "v${VERSION}t" -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION}t (Tauri)" \
-            --notes "v${VERSION}t · compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
+          gh release create "v${VERSION}" -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION} (Tauri)" \
+            --notes "v${VERSION} · compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
 
   build:
     needs: prepare
@@ -216,10 +216,10 @@ jobs:
               arch="$(echo '${{ matrix.target }}' | cut -d- -f1)"
               for f in "$b"/macos/*.app.tar.gz "$b"/macos/*.app.tar.gz.sig; do [ -f "$f" ] && cp "$f" "$b/$(basename "$f" | sed "s/\.app\.tar\.gz/_${arch}.app.tar.gz/")"; done
             fi
-            find "$b" -maxdepth 2 -type f -name '*.sig' -not -path '*/macos/*' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
-            find "$b" -maxdepth 1 -type f -name '*.app.tar.gz' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+            find "$b" -maxdepth 2 -type f -name '*.sig' -not -path '*/macos/*' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+            find "$b" -maxdepth 1 -type f -name '*.app.tar.gz' -print0 | xargs -0 -r gh release upload "v${{ needs.prepare.outputs.version }}" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
           fi
-          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}t" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0             | xargs -0 gh release upload "v${{ needs.prepare.outputs.version }}" -R "$GITHUB_REPOSITORY" --clobber > /dev/null
 
       - name: Registro cifrado
         if: failure()
@@ -253,7 +253,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          TAG="v${VERSION}t"; DL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          TAG="v${VERSION}"; DL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
           mkdir w && cd w
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sig' -p '*-setup.exe'
           sig() { cat "$1" 2>/dev/null || true; }
