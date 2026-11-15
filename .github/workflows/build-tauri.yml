@@ -145,8 +145,8 @@ jobs:
           # La de prueba se llama distinto y guarda aparte (env.rs PRUEBA): convive con el instalado.
           EC_PRUEBA: ${{ inputs.entregar && '1' || '' }}
           EC_VERSION: ${{ needs.prepare.outputs.version }}
-          # La de prueba lleva el inspector web (clic derecho → Inspeccionar) para ver errores.
-          FEAT: ${{ inputs.entregar && '--features devtools' || '' }}
+          # Ninguna lleva el inspector web: el código no se enseña (los errores van por diagnósticos y F1).
+          FEAT: ''
           CFG: ${{ inputs.entregar && '{"productName":"Events Client (Tauri)","mainBinaryName":"Events Client Tauri","identifier":"xyz.eventsmc.client.prueba","build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' || '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}' }}
         run: |
           LOG="$RUNNER_TEMP/build.log"
