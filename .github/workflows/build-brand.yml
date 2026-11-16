@@ -7,6 +7,10 @@
 # repo público de releases si no existe (EventsTeamMC/launcher-<id>), compila
 # las plataformas pedidas con `build.js --brand` y avisa al backend.
 #
+# Tauri (2.x): si el código de `ref` lleva tauri/, se compila el de Tauri con tauri/brand.mjs, firmado
+# para su actualizador (latest.json), y con beta.yml/latest.yml para que el de Electron de la marca
+# pase solo a este (como Events Client). Si no, el de Electron de siempre.
+#
 # El canal sale de la versión de `ref`, como en build.yml: X.Y.Z → release y
 # latest*.yml; X.Y.Z-beta.N → prerelease y beta*.yml, que solo leen los
 # jugadores con el canal beta. El backend elige `ref` (la última estable o la
@@ -62,6 +66,8 @@ jobs:
       old: ${{ steps.release.outputs.old }}
       new: ${{ steps.release.outputs.new }}
       pre: ${{ steps.release.outputs.pre }}
+      tauri: ${{ steps.src.outputs.tauri }}
+      version: ${{ steps.src.outputs.version }}
     steps:
       - name: Ejecuciones anteriores fuera
         env:
@@ -84,6 +90,13 @@ jobs:
             fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$REF"
           git -C src checkout -q FETCH_HEAD
           echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ -f src/tauri/src-tauri/tauri.conf.json ]; then
+            echo "tauri=true" >> "$GITHUB_OUTPUT"
+            echo "version=$(node -p "require('./src/tauri/src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+          else
+            echo "tauri=false" >> "$GITHUB_OUTPUT"
+            echo "version=$(node -p "require('./src/package.json').version")" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Marca
         env:
@@ -122,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           REPO=$(jq -r .build.releasesRepo brand.json)
-          VERSION=$(node -p "require('./src/package.json').version")
+          VERSION="${{ steps.src.outputs.version }}"
           PRE=false
           [[ "$VERSION" == *-* ]] && PRE=true
           # Borradores de esta versión que dejó una ejecución que no llegó a `report`.
@@ -138,14 +151,21 @@ jobs:
       - id: matrix
         env:
           P: ${{ inputs.platforms }}
+          TAURI: ${{ steps.src.outputs.tauri }}
         run: |
           set -euo pipefail
           OS=()
-          [[ "$P" == *windows* ]] && OS+=('"windows-latest"')
-          [[ "$P" == *macos* ]] && OS+=('"macos-latest"')
-          [[ "$P" == *linux* ]] && OS+=('"ubuntu-latest"')
+          if [ "$TAURI" = true ]; then
+            [[ "$P" == *windows* ]] && OS+=('{"os":"windows-latest","target":"x86_64-pc-windows-msvc","bundles":"nsis"}')
+            [[ "$P" == *macos* ]] && OS+=('{"os":"macos-latest","target":"aarch64-apple-darwin","bundles":"app,dmg"}' '{"os":"macos-latest","target":"x86_64-apple-darwin","bundles":"app,dmg"}')
+            [[ "$P" == *linux* ]] && OS+=('{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"}')
+          else
+            [[ "$P" == *windows* ]] && OS+=('{"os":"windows-latest"}')
+            [[ "$P" == *macos* ]] && OS+=('{"os":"macos-latest"}')
+            [[ "$P" == *linux* ]] && OS+=('{"os":"ubuntu-latest"}')
+          fi
           [ ${#OS[@]} -gt 0 ] || { echo "::error::Sin plataformas"; exit 1; }
-          echo "matrix={\"os\":[$(IFS=,; echo "${OS[*]}")]}" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":[$(IFS=,; echo "${OS[*]}")]}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -179,15 +199,18 @@ jobs:
 
       - name: Dependencias
         working-directory: src
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: ${{ needs.prepare.outputs.tauri == 'true' && '1' || '' }}
         run: |
           npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm.log" 2>&1 \
             || { echo "::error::npm ci ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
 
       - name: rpmbuild
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && needs.prepare.outputs.tauri != 'true'
         run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rpm > /dev/null
 
       - name: Compilar
+        if: needs.prepare.outputs.tauri != 'true'
         working-directory: src
         env:
           GH_TOKEN: ${{ !inputs.dry_run && secrets.BRANDS_TOKEN || '' }}
@@ -201,8 +224,97 @@ jobs:
             || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
           ls dist | grep -E '\.(exe|msi|dmg|zip|AppImage|deb|rpm|tar\.gz)$' || true
 
-  report:
+      # ---- Tauri ----
+      - name: Marca en Tauri (nombre, iconos, EC_BRAND_*)
+        if: needs.prepare.outputs.tauri == 'true'
+        working-directory: src
+        run: node tauri/brand.mjs ../brand.json > "$RUNNER_TEMP/brand.log" 2>&1 || { echo "::error::No se pudo preparar la marca"; exit 1; }
+
+      - name: Sistema (Tauri)
+        if: needs.prepare.outputs.tauri == 'true'
+        run: |
+          {
+            rustup target add ${{ matrix.target }}
+            if [ "$RUNNER_OS" = Linux ]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+            fi
+          } > "$RUNNER_TEMP/sys.log" 2>&1 || { echo "::error::No se pudo preparar el sistema"; exit 1; }
+
+      - name: Compilar (Tauri)
+        if: needs.prepare.outputs.tauri == 'true'
+        working-directory: src
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ !inputs.dry_run && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ !inputs.dry_run && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          EC_VERSION: ${{ needs.prepare.outputs.version }}
+          UPD: ${{ !inputs.dry_run && 'true' || 'false' }}
+        run: |
+          ( (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs) \
+            && cd tauri/src-tauri \
+            && npx --yes @tauri-apps/cli@2.9.4 build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} \
+                 --config "{\"version\":\"$EC_VERSION\",\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":$UPD}}" \
+          ) > "$RUNNER_TEMP/build.log" 2>&1 || { echo "::error::La compilación ha fallado (el registro no se publica: reprodúcelo en local)"; exit 1; }
+          find "tauri/target/${{ matrix.target }}/release/bundle" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) -exec basename {} \;
+
+      - name: Subir (Tauri)
+        if: needs.prepare.outputs.tauri == 'true' && !inputs.dry_run
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.BRANDS_TOKEN }}
+          REPO: ${{ needs.prepare.outputs.repo }}
+          TAG: v${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          b="tauri/target/${{ matrix.target }}/release/bundle"
+          # macOS: el .app.tar.gz se llama igual en las dos arquitecturas; se le pone la suya.
+          if [ "$RUNNER_OS" = macOS ]; then
+            arch="$(echo '${{ matrix.target }}' | cut -d- -f1)"
+            for f in "$b"/macos/*.app.tar.gz "$b"/macos/*.app.tar.gz.sig; do [ -f "$f" ] && cp "$f" "$b/$(basename "$f" | sed "s/\.app\.tar\.gz/_${arch}.app.tar.gz/")"; done
+          fi
+          find "$b" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.sig' -o -name '*.app.tar.gz' \) -not -path '*/macos/*' -print0 \
+            | xargs -0 gh release upload "$TAG" -R "$REPO" --clobber > /dev/null
+
+  # Tauri: los avisos de versión nueva en la release de la marca.
+  #  · latest.json: el actualizador de Tauri.
+  #  · beta.yml (o latest.yml en estable): el de Electron de la marca, que así pasa a este (Windows).
+  feeds:
     needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.tauri == 'true' && !inputs.dry_run && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BRANDS_TOKEN }}
+      REPO: ${{ needs.prepare.outputs.repo }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PRE: ${{ needs.prepare.outputs.pre }}
+    steps:
+      - name: latest.json y .yml
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"; DL="https://github.com/$REPO/releases/download/$TAG"
+          mkdir w && cd w
+          gh release download "$TAG" -R "$REPO" -p '*.sig' -p '*-setup.exe'
+          win="$(ls *-setup.exe 2>/dev/null | head -1 || true)"; mac_a="$(ls *aarch64.app.tar.gz.sig 2>/dev/null | head -1 || true)"; mac_x="$(ls *x86_64.app.tar.gz.sig 2>/dev/null | head -1 || true)"; lin="$(ls *.AppImage.sig 2>/dev/null | head -1 || true)"
+          YML=latest.yml; [ "$PRE" = true ] && YML=beta.yml
+          node -e '
+            const [v, dl, win, ma, mx, lin, yml] = process.argv.slice(1);
+            const fs = require("fs"), name = (f) => encodeURIComponent(f.replace(/ /g, "."));
+            const p = {};
+            const add = (k, file, sigf) => { if (file && fs.existsSync(sigf)) p[k] = { signature: fs.readFileSync(sigf, "utf8").trim(), url: dl + "/" + name(file) }; };
+            add("windows-x86_64", win, win + ".sig");
+            if (ma) add("darwin-aarch64", ma.replace(/\.sig$/, ""), ma);
+            if (mx) add("darwin-x86_64", mx.replace(/\.sig$/, ""), mx);
+            if (lin) add("linux-x86_64", lin.replace(/\.sig$/, ""), lin);
+            fs.writeFileSync("latest.json", JSON.stringify({ version: v, notes: "", pub_date: new Date().toISOString(), platforms: p }, null, 2));
+            if (win) {
+              const crypto = require("crypto"), buf = fs.readFileSync(win), sha = crypto.createHash("sha512").update(buf).digest("base64"), file = win.replace(/ /g, ".");
+              fs.writeFileSync(yml, `version: ${v}\nfiles:\n  - url: ${file}\n    sha512: ${sha}\n    size: ${buf.length}\npath: ${file}\nsha512: ${sha}\nreleaseDate: ${JSON.stringify(new Date().toISOString())}\n`);
+            }
+          ' "$VERSION" "$DL" "$win" "$mac_a" "$mac_x" "$lin" "$YML"
+          gh release upload "$TAG" -R "$REPO" --clobber latest.json $( [ -f "$YML" ] && echo "$YML" ) > /dev/null
+
+  report:
+    needs: [prepare, build, feeds]
     if: ${{ always() && !inputs.dry_run && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     env:
@@ -215,7 +327,7 @@ jobs:
     steps:
       - name: Publicar (solo con todas las plataformas)
         id: publish
-        if: needs.build.result == 'success'
+        if: needs.build.result == 'success' && (needs.prepare.outputs.tauri != 'true' || needs.feeds.result == 'success')
         run: |
           set -euo pipefail
           # Una beta sale como prerelease y no pasa a «latest»: los jugadores en estable no la ven.
