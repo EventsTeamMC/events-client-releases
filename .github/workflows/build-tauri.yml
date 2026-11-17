@@ -13,7 +13,7 @@
 #
 # Secreto: SOURCE_TOKEN (Contents: read de EventsTeamMC/events-client).
 name: Events Client (Tauri)
-run-name: ${{ inputs.publicar && 'Beta pública (borrador)' || inputs.entregar && 'Instaladores de prueba' || 'Compilación de prueba' }}
+run-name: ${{ inputs.publicar && 'Versión pública (borrador)' || inputs.entregar && 'Instaladores de prueba' || 'Compilación de prueba' }}
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ on:
         type: boolean
         default: false
       publicar:
-        description: 'Beta pública: la versión de producción, firmada, en un borrador prerelease listo para publicar (no publica nada solo)'
+        description: 'Versión pública: la de producción, firmada, en un borrador listo para publicar (beta si la versión lleva -beta, estable si no; no publica nada solo)'
         type: boolean
         default: false
 
@@ -64,6 +64,7 @@ jobs:
     outputs:
       sha: ${{ steps.src.outputs.sha }}
       version: ${{ steps.src.outputs.version }}
+      pre: ${{ steps.src.outputs.pre }}
     steps:
       - name: Ejecuciones anteriores fuera
         env:
@@ -87,18 +88,22 @@ jobs:
           # Tauri lleva su versión (tauri.conf.json); las de aquí, -dev.N en orden (la 9.ª ejecución fue la dev.1).
           BASE=$(git -C src show FETCH_HEAD:tauri/src-tauri/tauri.conf.json | node -p 'JSON.parse(require("fs").readFileSync(0)).version')
           if [ "${{ inputs.publicar }}" = true ]; then echo "version=${BASE}" >> "$GITHUB_OUTPUT"; else echo "version=${BASE}-dev.$(( GITHUB_RUN_NUMBER - 8 ))" >> "$GITHUB_OUTPUT"; fi
+          # 2.0.0-beta.3 → prerelease (canal beta); 2.0.0 → estable.
+          case "$BASE" in *-*) echo "pre=true" >> "$GITHUB_OUTPUT" ;; *) echo "pre=false" >> "$GITHUB_OUTPUT" ;; esac
 
       # Un borrador no lo ve nadie fuera del repo, ni el actualizador ni la web de descargas.
-      # La beta pública también empieza como borrador (prerelease): se publica a mano cuando toca.
-      - name: Borrador de la beta
+      # La versión pública también empieza como borrador (prerelease si es beta): se publica a mano cuando toca.
+      - name: Borrador de la versión
         if: ${{ inputs.publicar }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.src.outputs.version }}
+          PRE: ${{ steps.src.outputs.pre }}
         run: |
+          if [ "$PRE" = true ]; then FLAGS=--prerelease; NOTES="Beta de Events Client 2.0."; else FLAGS=; NOTES="Events Client ${VERSION}."; fi
           gh release view "v${VERSION}" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
-            || gh release create "v${VERSION}" -R "$GITHUB_REPOSITORY" --draft --prerelease --title "Events Client ${VERSION}" \
-                 --notes "Beta de Events Client 2.0." > /dev/null
+            || gh release create "v${VERSION}" -R "$GITHUB_REPOSITORY" --draft $FLAGS --title "Events Client ${VERSION}" \
+                 --notes "$NOTES" > /dev/null
 
       - name: Borrador de prueba
         if: ${{ inputs.entregar && !inputs.publicar }}
@@ -236,10 +241,13 @@ jobs:
           echo "===== FIN ====="
           rm -f "$RUNNER_TEMP/k"
 
-  # Beta pública: los dos avisos de versión nueva, en el borrador.
+  # Versión pública: los avisos de versión nueva, en el borrador.
   #  · latest.json: el actualizador de Tauri (paquete y firma de cada sistema).
   #  · beta.yml: el de Electron en el canal beta (electron-updater). Le ofrece el instalador de
   #    Tauri para Windows: así quien está en la beta del launcher de Electron pasa a esta.
+  #  · latest.yml (solo en estable, I-12): lo mismo para el canal estable de Electron. Va también
+  #    beta.yml, porque el canal beta de electron-updater mira la última release, sea o no beta.
+  #    La sesión, las cuentas y las instancias las trae migrate.rs en el primer arranque.
   feeds:
     needs: [prepare, build]
     if: ${{ inputs.publicar }}
@@ -247,10 +255,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: latest.json y beta.yml
+      - name: latest.json y .yml
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          PRE: ${{ needs.prepare.outputs.pre }}
         run: |
           set -euo pipefail
           TAG="v${VERSION}"; DL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
@@ -271,5 +280,6 @@ jobs:
             const crypto = require("crypto"), buf = fs.readFileSync(win), sha = crypto.createHash("sha512").update(buf).digest("base64"), file = win.replace(/ /g, ".");
             fs.writeFileSync("beta.yml", `version: ${v}\nfiles:\n  - url: ${file}\n    sha512: ${sha}\n    size: ${buf.length}\npath: ${file}\nsha512: ${sha}\nreleaseDate: ${JSON.stringify(new Date().toISOString())}\n`);
           ' "$VERSION" "$DL" "$win" "$mac_a" "$mac_x" "$lin"
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber latest.json beta.yml > /dev/null
+          YMLS=beta.yml; [ "$PRE" = true ] || { cp beta.yml latest.yml; YMLS="beta.yml latest.yml"; }
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber latest.json $YMLS > /dev/null
           echo "Avisos subidos a $TAG (borrador). Para publicarla: gh release edit $TAG --draft=false"
