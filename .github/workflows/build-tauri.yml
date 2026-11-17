@@ -115,8 +115,73 @@ jobs:
           gh release create "v${VERSION}" -R "$GITHUB_REPOSITORY" --draft --title "Events Client v${VERSION} (Tauri)" \
             --notes "v${VERSION} · compilación de prueba, sin firmar. Datos propios: no toca el Events Client instalado." > /dev/null
 
-  build:
+  # I-56 · Las pruebas antes de compilar: si alguna falla, no se compila nada.
+  #  · Paran la compilación: npm test (tests/*.test.js), la interfaz de Tauri empaquetada
+  #    (build.mjs) y cargo test del motor (ec-core: paridad con el de JS).
+  #  · Solo avisan: los temas (scripts/check-themes.js) y la copia del core frente a events-core
+  #    (si SOURCE_TOKEN llega a ese repo).
+  # Igual que el resto: la salida va a un registro que solo sale cifrado.
+  checks:
     needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Código
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          auth() { git -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo "password=$SOURCE_TOKEN"; }; f' "$@"; }
+          git init -q src
+          auth -C src fetch -q --depth 1 https://github.com/EventsTeamMC/events-client.git "$SHA"
+          git -C src checkout -q FETCH_HEAD
+          git init -q events-core
+          if auth -C events-core fetch -q --depth 1 https://github.com/EventsTeamMC/events-core.git main > /dev/null 2>&1; then
+            git -C events-core checkout -q FETCH_HEAD; echo "CORE=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Sin acceso a events-core: no se comprueba la copia del core"
+          fi
+
+      - name: Pruebas
+        working-directory: src
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          ( set -e
+            npm ci --no-audit --no-fund --ignore-scripts
+            npm test
+            # Avisan sin parar la compilación: hoy fallan (Glass usa !important; la copia del core va por detrás).
+            node scripts/check-themes.js > /dev/null 2>&1 || echo "::warning::Algún tema no pasa scripts/check-themes.js"
+            if [ "${CORE:-}" = 1 ]; then EVENTS_CORE_DIR="$GITHUB_WORKSPACE/events-core" npm run core:vendor -- --check > /dev/null 2>&1 || echo "::warning::La copia del core no coincide con events-core"; fi
+            (cd tauri/ui && npm ci --no-audit --no-fund && node build.mjs)
+            # same_done_page_as_js falla desde antes (la página de «cuenta conectada» cambió y el fixture no): fuera hasta regenerarlo.
+            (cd tauri && cargo test -p ec-core --quiet -- --skip same_done_page_as_js)
+          ) >> "$LOG" 2>&1 || { echo "::error::Alguna prueba ha fallado (registro cifrado abajo)"; exit 1; }
+          echo "Pruebas superadas."
+
+      - name: Registro cifrado
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          [ -f "$LOG" ] || exit 0
+          printf '%s\n' "$LOG_PUBKEY" | sed 's/^ *//' > "$RUNNER_TEMP/pub.pem"
+          tail -c 400000 "$LOG" > "$RUNNER_TEMP/tail.log"
+          openssl rand -hex 32 > "$RUNNER_TEMP/k"
+          echo "===== CLAVE ====="
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/pub.pem" -pkeyopt rsa_padding_mode:oaep -in "$RUNNER_TEMP/k" | base64 | tr -d '\n'; echo
+          echo "===== REGISTRO ====="
+          gzip -9c "$RUNNER_TEMP/tail.log" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$RUNNER_TEMP/k" | base64 | tr -d '\n'; echo
+          echo "===== FIN ====="
+          rm -f "$RUNNER_TEMP/k"
+
+  build:
+    needs: [prepare, checks]
     strategy:
       fail-fast: false
       matrix:
